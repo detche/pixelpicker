@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+import gi
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gtk, PangoCairo, Pango
+import cairo, signal, argparse, sys
+
+VERSION = "1.0"
+
+UI_FONT = "FreeMono Bold 15"
+UI_COLOR_BG = "#d0d0d0"
+UI_COLOR_FONT = "#1c1c1c"
+UI_COLOR_BORDER = "#000000"
+UI_SIZE_BORDER = 2
+UI_SIZE_PADDING = 4
+UI_OFFSET_X = 10
+UI_OFFSET_Y = 20
+
+def get_pixel_at(position):
+    """ Retrieve the pixel on the given screen position. """
+    wnd = Gdk.get_default_root_window()
+    px = Gdk.pixbuf_get_from_window(wnd, position.x, position.y, 1, 1)
+    return px.get_pixels()
+
+def to_hex_color(pixbuf):
+    """ Convert the pixel color to its hexadecimal representation. """
+    return "#" \
+        + format(pixbuf[0], '02x') \
+        + format(pixbuf[1], '02x') \
+        + format(pixbuf[2], '02x')
+
+def from_hex_color(hex: str) -> Gdk.RGBA:
+    """ Returns an RGBA object based on hex color string. """
+    rgba = Gdk.RGBA()
+    rgba.parse(hex)
+    return rgba
+
+def set_color(cr: cairo.Context, color, alpha = 1):
+    """ Sets paint color based on given hex color string. """
+    if isinstance(color, Gdk.RGBA):
+        cr.set_source_rgba(color.red, color.green, color.blue, alpha)
+    elif isinstance(color, str):
+        rgba = Gdk.RGBA()
+        rgba.parse(color)
+        cr.set_source_rgba(rgba.red, rgba.green, rgba.blue, alpha)
+    else:
+        cr.set_source_rgba(
+            color[0] / 255.0,
+            color[1] / 255.0, 
+            color[2] / 255.0,
+            alpha)
+
+class PixelPicker(Gtk.Window):
+    """ Allows to pick the color of a pixel on the screen. """
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Config is used to define what we paint over our invisible overlay.
+        self.config = config
+        self.ui_col_bg = from_hex_color(config.ui_color_bg)
+        self.ui_col_ft = from_hex_color(config.ui_color_font)
+        self.ui_col_bd = from_hex_color(config.ui_color_border)
+        self.ui_font = Pango.font_description_from_string(config.ui_font)
+
+        # Allows us to track mouse events so we can move our little UI.
+        self.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
+
+        # Configure our window to have no decorations (eg titlebar) and be
+        # drawable (for our transparency).
+        self.set_app_paintable(True)
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowType.TOPLEVEL)
+
+        # Setup transparency as the window visual.
+        self._screen = self.get_screen() # type: Gdk.Screen
+        self._display = self._screen.get_display()
+        self._visual = self._screen.get_rgba_visual()
+        if self._visual is not None:
+            self.set_visual(self._visual)
+
+        self.connect("draw", self.on_draw)
+        self.connect("realize", self.on_realize)
+        self.connect("motion-notify-event", self.on_motion)
+
+        pos = self._display.get_default_seat().get_pointer().get_position()
+        self.current_position = pos
+        self.current_pixel = get_pixel_at(pos)
+
+        self.width = None
+        self.height = None
+
+    def is_supported(self):
+        """ Returns whether overlay is supported in current desktop. """
+        return self._visual is not None and self._screen.is_composited()
+
+    def on_draw(self, widget, cr):
+        # Paint the invisible layer by copying from whats on screen.
+        cr.set_source_rgba(1, 1, 1, 0)
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        # Then our color indicator above that.
+        if self.current_position is not None and self.current_pixel is not None:
+            # Prepare text, we use its dimensions as a base for box dimensions.
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(self.ui_font)
+            layout.set_text(to_hex_color(self.current_pixel))
+            txtsize = layout.get_pixel_size()
+            sqsize = txtsize.height
+            height = txtsize.height \
+                + self.config.ui_size_padding*2 \
+                + self.config.ui_size_border*4
+            width = self.config.ui_size_padding*3 \
+                + self.config.ui_size_border*4 \
+                + txtsize.width + sqsize
+
+            # Position the indicator in a visible position next to pointer
+            x = self.current_position.x + self.config.ui_offset_x
+            y = self.current_position.y + self.config.ui_offset_y
+            if self.width is not None and (x + width) > self.width:
+                x = self.current_position.x - width - self.config.ui_offset_x
+            if self.height is not None and (y + height) > self.height:
+                y = self.current_position.y - height - self.config.ui_offset_y
+
+            # Paint external border
+            set_color(cr, self.ui_col_bd)
+            cr.rectangle(x, y, width, height)
+            cr.fill()
+            
+            # Paint background
+            set_color(cr, self.ui_col_bg)
+            cr.rectangle(
+                x + self.config.ui_size_border,
+                y + self.config.ui_size_border,
+                width - self.config.ui_size_border*2,
+                height - self.config.ui_size_border*2)
+            cr.fill()
+
+            # Then color square border
+            set_color(cr, self.ui_col_bd)
+            cr.rectangle(
+                x + self.config.ui_size_border + self.config.ui_size_padding,
+                y + self.config.ui_size_border + self.config.ui_size_padding,
+                sqsize + self.config.ui_size_border*2,
+                sqsize + self.config.ui_size_border*2)
+            cr.fill()
+
+            # Then color square
+            set_color(cr, self.current_pixel)
+            cr.rectangle(
+                x + self.config.ui_size_border*2 + self.config.ui_size_padding,
+                y + self.config.ui_size_border*2 + self.config.ui_size_padding,
+                sqsize,
+                sqsize)
+            cr.fill()
+
+            # Finally, the color text value.
+            set_color(cr, self.ui_col_ft)
+            cr.move_to(
+                x + self.config.ui_size_padding*2
+                    + self.config.ui_size_border*3 + sqsize,
+                y + self.config.ui_size_padding + self.config.ui_size_border*2)
+            PangoCairo.show_layout(cr, layout)
+
+    def on_realize(self, widget):
+        # Here we ensure the overlay window is not visible from the window
+        # manager, as it could prevent other apps from being visible behind our
+        # transparent layer (we'd see a blank desktop).
+        wnd = widget.get_window()
+        wnd.set_override_redirect(True)
+        wnd.set_decorations(0)
+        # Make our layer cover the full screen.
+        monitor = self._display.get_monitor_at_window(wnd)
+        area = monitor.get_workarea()
+        self.resize(area.width, area.height)
+        self.width = area.width
+        self.height = area.height
+        return True
+
+    def on_motion(self, wnd, event: Gdk.EventMotion):
+        self.current_position = event 
+        self.current_pixel = get_pixel_at(event)
+        self.queue_draw()
+        return True
+
+def add_arg(parser: argparse.ArgumentParser, short, arg, type, default):
+    if short is not None:
+        parser.add_argument(
+            "-" + short,
+            "--" + arg,
+            dest=arg.replace('-', '_'),
+            type=type,
+            default=default)
+    else:
+        parser.add_argument(
+            "--" + arg,
+            dest=arg.replace('-', '_'),
+            type=type,
+            default=default)
+
+def main(args):
+    parser = argparse.ArgumentParser(args)
+    add_arg(parser, "F", "ui-font", str, UI_FONT)
+    add_arg(parser, None, "ui-color-bg", str, UI_COLOR_BG)
+    add_arg(parser, None, "ui-color-font", str, UI_COLOR_FONT)
+    add_arg(parser, None, "ui-color-border", str, UI_COLOR_BORDER)
+    add_arg(parser, None, "ui-size-border", int, UI_SIZE_BORDER)
+    add_arg(parser, None, "ui-size-padding", int, UI_SIZE_PADDING)
+    add_arg(parser, None, "ui-offset-x", int, UI_OFFSET_X)
+    add_arg(parser, None, "ui-offset-y", int, UI_OFFSET_Y)
+    parser.add_argument('--version', action='version',
+        version='pixelpicker' + VERSION)
+    parser.add_argument(
+        "-n", "--no-new-line", action="store_const", const=True,
+        default=False, dest="no_new_line",
+        help="do not print a new line after picked color code")
+
+    config = parser.parse_args()
+    picker = PixelPicker(config)
+    if not picker.is_supported():
+        print("unsupported: no screen compositor available", file=sys.stderr)
+        exit(1)
+
+    def on_pixel_clicked(wnd, event: Gdk.EventButton):
+        click = event.get_button()
+        if not click[0] or click[1] != 1: return
+        print(
+            to_hex_color(get_pixel_at(event)),
+            end="" if config.no_new_line else "\n")
+        Gtk.main_quit()
+        return True
+
+    picker.connect("button-release-event", on_pixel_clicked)
+    picker.connect('destroy', Gtk.main_quit)
+    signal.signal(signal.SIGINT, Gtk.main_quit)
+    signal.signal(signal.SIGTSTP, Gtk.main_quit)
+
+    picker.show_all()
+    Gtk.main()
+
+if __name__ == "__main__":
+    main(sys.argv)
+
